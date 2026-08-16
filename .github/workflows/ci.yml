@@ -1,5 +1,7 @@
 name: Win32-OpenSSH CI
 
+run-name: ${{ github.workflow }} on ${{ github.event.inputs.target_ref || github.ref_name }}
+
 on:
   push:
     branches:
@@ -7,6 +9,12 @@ on:
   pull_request:
     branches:
     - latestw_all
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: 'Checkout from'
+        required: true
+        default: latestw_all
 
 # Approximates the AzDO batched trigger: coalesce runs on the same ref
 concurrency:
@@ -41,6 +49,8 @@ jobs:
           triplet: x86-custom
     steps:
     - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.target_ref || github.ref }}
 
     - name: Verify version info
       run: |
@@ -124,6 +134,8 @@ jobs:
           includeConfig: false
     steps:
     - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.target_ref || github.ref }}
 
     - name: Install and bootstrap vcpkg
       run: |
@@ -238,6 +250,8 @@ jobs:
       ARTIFACTS_DIR: ${{ github.workspace }}\artifacts
     steps:
     - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.target_ref || github.ref }}
 
     - name: Download build artifacts
       uses: actions/download-artifact@v4
@@ -346,6 +360,8 @@ jobs:
       ARTIFACTS_DIR: ${{ github.workspace }}\artifacts
     steps:
     - uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.inputs.target_ref || github.ref }}
 
     - name: Download build artifacts
       uses: actions/download-artifact@v4
