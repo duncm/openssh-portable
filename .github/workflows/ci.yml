@@ -1,0 +1,419 @@
+name: Win32-OpenSSH CI
+
+on:
+  push:
+    branches:
+    - latestw_all
+  pull_request:
+    branches:
+    - latestw_all
+
+# Approximates the AzDO batched trigger: coalesce runs on the same ref
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  VCPKG_CACHE_DIR: ${{ github.workspace }}\binary-cache
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  install-dependencies:
+    name: Install vcpkg Dependencies (${{ matrix.arch }})
+    # Pinned to windows-2022: OpenSSHBuildHelper.psm1 detects the VS version from
+    # the MSBuild path ("2022"/"2019"/"2017"); windows-latest now ships VS2026
+    # under "...\Microsoft Visual Studio\18\..." which falls through to the
+    # VS2015 branch and fails on the unset VS140COMNTOOLS env var.
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - arch: x64
+          triplet: x64-custom
+        - arch: x86
+          triplet: x86-custom
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Verify version info
+      run: |
+        # Compare LibreSSL versions in vcpkg.json and add-resource-file.patch
+        $vcpkgObj = Get-Content "$env:GITHUB_WORKSPACE/contrib/win32/openssh/vcpkg.json" | ConvertFrom-Json
+        $libresslVersionJson = $vcpkgObj | Select-Object -ExpandProperty overrides | Where-Object { $_.name -eq 'libressl' } | Select-Object -ExpandProperty version
+
+        # resource file version needs to be trimmed (e.g. 4.0.0.0 to 4.0.0)
+        $patchContent = Get-Content "$env:GITHUB_WORKSPACE/contrib/win32/openssh/vcpkg_overlay_ports/libressl/add-version-file.patch"
+        $libresslVersionPatch = ($patchContent -join "`n" | Select-String -Pattern '"FileVersion",\s*"(\d+\.\d+\.\d+\.\d+)"' -AllMatches).Matches | ForEach-Object { $_.Groups[1].Value }
+        $libresslVersionPatchParts = $libresslVersionPatch -split '\.'
+        $libresslVersionPatchShort = ($libresslVersionPatchParts[0..2] -join '.')
+
+        if ($libresslVersionJson -ne $libresslVersionPatchShort) {
+          Write-Error "LibreSSL version mismatch: vcpkg.json has $libresslVersionJson, patch file has $libresslVersionPatch"
+          exit 1
+        } else {
+          Write-Verbose -Verbose "LibreSSL versions match: $libresslVersionJson"
+        }
+
+    - name: Install and bootstrap vcpkg
+      run: |
+        $ErrorActionPreference = 'Stop'
+        mkdir "$env:VCPKG_CACHE_DIR"
+        git clone https://github.com/microsoft/vcpkg
+        cd vcpkg
+        & ./bootstrap-vcpkg.bat
+        & ./vcpkg.exe integrate install
+
+    - name: Install vcpkg dependencies (${{ matrix.triplet }})
+      run: |
+        $triplet = '${{ matrix.triplet }}'
+        Write-Verbose -Verbose "Installing vcpkg dependencies for triplet: $triplet"
+
+        Push-Location "$env:GITHUB_WORKSPACE/contrib/win32/openssh"
+        try {
+          & "$env:GITHUB_WORKSPACE/vcpkg/vcpkg.exe" install --triplet $triplet --overlay-triplets=.\vcpkg_triplets --overlay-ports=.\vcpkg_overlay_ports
+          if ($LASTEXITCODE -ne 0) {
+            throw "vcpkg install failed with exit code $LASTEXITCODE"
+          }
+        } finally {
+          Pop-Location
+        }
+      env:
+        VCPKG_BINARY_SOURCES: clear;files,${{ env.VCPKG_CACHE_DIR }},readwrite
+
+    - name: Capture vcpkg cache directory (${{ matrix.arch }})
+      run: |
+        if (Test-Path -Path $env:VCPKG_CACHE_DIR) {
+          Write-Verbose -Verbose "vcpkg cache directory contents:"
+          Get-ChildItem -Path $env:VCPKG_CACHE_DIR -Recurse -Depth 2 | Select-Object -First 50
+        } else {
+          Write-Error "vcpkg cache directory not found at: $env:VCPKG_CACHE_DIR"
+          exit 1
+        }
+
+    - name: Upload vcpkg dependencies (${{ matrix.arch }})
+      uses: actions/upload-artifact@v4
+      with:
+        name: vcpkg-dependencies-${{ matrix.arch }}
+        path: ${{ env.VCPKG_CACHE_DIR }}
+        if-no-files-found: error
+
+  build:
+    name: Build Package (${{ matrix.arch }})
+    needs: install-dependencies
+    # Pinned to windows-2022: OpenSSHBuildHelper.psm1 detects the VS version from
+    # the MSBuild path ("2022"/"2019"/"2017"); windows-latest now ships VS2026
+    # under "...\Microsoft Visual Studio\18\..." which falls through to the
+    # VS2015 branch and fails on the unset VS140COMNTOOLS env var.
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - arch: x64
+          buildOutputDir: x64
+          includeConfig: true
+        - arch: x86
+          buildOutputDir: Win32
+          includeConfig: false
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install and bootstrap vcpkg
+      run: |
+        $ErrorActionPreference = 'Stop'
+        mkdir "$env:VCPKG_CACHE_DIR"
+        git clone https://github.com/microsoft/vcpkg
+        cd vcpkg
+        & ./bootstrap-vcpkg.bat
+        & ./vcpkg.exe integrate install
+
+    - name: Download vcpkg dependencies (vcpkg-dependencies-${{ matrix.arch }})
+      uses: actions/download-artifact@v4
+      with:
+        name: vcpkg-dependencies-${{ matrix.arch }}
+        path: ${{ env.VCPKG_CACHE_DIR }}
+
+    - name: Build Win32-OpenSSH (${{ matrix.arch }})
+      run: |
+        $nativeArch = '${{ matrix.arch }}'
+        Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
+        Invoke-AzDOBuild -NativeHostArch $nativeArch
+      env:
+        VCPKG_BINARY_SOURCES: clear;files,${{ env.VCPKG_CACHE_DIR }},readwrite
+
+    - name: Capture build results (${{ matrix.arch }})
+      run: |
+        $buildOutPath = "$env:GITHUB_WORKSPACE/bin"
+        $buildOutputDir = '${{ matrix.buildOutputDir }}'
+        $fullPath = Join-Path -Path $buildOutPath -ChildPath $buildOutputDir
+        $releasePath = Join-Path -Path $fullPath -ChildPath 'Release'
+        Get-ChildItem -Path $releasePath
+
+    - name: Stage Win32-OpenSSH build artifacts (${{ matrix.arch }})
+      run: |
+        $nativeArch = '${{ matrix.arch }}'
+        $artifactSuffix = '${{ matrix.arch }}'
+
+        Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
+        #
+        # Copy build artifacts
+        $buildDestPath = "$env:GITHUB_WORKSPACE/Win32-OpenSSH-$artifactSuffix"
+        if (Test-Path -Path $buildDestPath) {
+          Remove-Item -Path $buildDestPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        $null = New-Item -ItemType Directory -Path $buildDestPath -Force
+        $buildDestArchPath = Join-Path -Path $buildDestPath -ChildPath "$nativeArch/Release"
+        Copy-BuildResults -BuildResultsPath $buildDestArchPath -NativeHostArch $nativeArch -Configuration Release
+        #
+        # Copy unit tests
+        $buildOutPath = "$env:GITHUB_WORKSPACE/bin"
+        $unitTestDestPath = "$env:GITHUB_WORKSPACE/UnitTests-$artifactSuffix"
+        if (Test-Path -Path $unitTestDestPath) {
+          Remove-Item -Path $unitTestDestPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        $null = New-Item -ItemType Directory -Path $unitTestDestPath -Force
+        Copy-UnitTests -UnitTestsSrcDir $buildOutPath -UnitTestsDestDir $unitTestDestPath -NativeHostArch $nativeArch -Configuration Release
+
+    - name: Upload Win32-OpenSSH build artifacts (${{ matrix.arch }})
+      uses: actions/upload-artifact@v4
+      with:
+        name: Win32-OpenSSH-${{ matrix.arch }}
+        path: ${{ github.workspace }}\Win32-OpenSSH-${{ matrix.arch }}
+        if-no-files-found: error
+
+    - name: Upload unit test artifacts (${{ matrix.arch }})
+      uses: actions/upload-artifact@v4
+      with:
+        name: UnitTests-${{ matrix.arch }}
+        path: ${{ github.workspace }}\UnitTests-${{ matrix.arch }}
+        if-no-files-found: error
+
+    - name: Upload config.h file for bash tests (${{ matrix.arch }})
+      if: matrix.includeConfig
+      uses: actions/upload-artifact@v4
+      with:
+        name: ConfigFile-${{ matrix.arch }}
+        path: ${{ github.workspace }}\config.h
+        if-no-files-found: error
+
+    - name: Surface warnings from build logs (${{ matrix.arch }})
+      run: |
+        $artifactSuffix = '${{ matrix.arch }}'
+        $logFileName = "OpenSSHRelease$artifactSuffix.log"
+        $uniqueLines = [System.Collections.Generic.HashSet[string]]::new()
+        $logFilePath = "$env:GITHUB_WORKSPACE/contrib/win32/openssh/$logFileName"
+        if (Test-Path -Path $logFilePath) {
+          $logLines = Get-Content $logFilePath
+          $buildSucceededIndex = $logLines.IndexOf("Build succeeded.")
+          if ($buildSucceededIndex -ge 0) {
+            $linesToCheck = $logLines[($buildSucceededIndex + 1)..$logLines.Length]
+            foreach ($line in $linesToCheck) {
+              if ($line -match "warning C") {
+                $uniqueLines.Add($line) | Out-Null
+              }
+            }
+          }
+        }
+        foreach ($uniqueLine in $uniqueLines) {
+          Write-Output $uniqueLine
+          Write-Host "::warning::$uniqueLine"
+        }
+
+  test-core:
+    name: Win32-OpenSSH Core Tests On Windows
+    needs: build
+    # Pinned to windows-2022: OpenSSHBuildHelper.psm1 detects the VS version from
+    # the MSBuild path ("2022"/"2019"/"2017"); windows-latest now ships VS2026
+    # under "...\Microsoft Visual Studio\18\..." which falls through to the
+    # VS2015 branch and fails on the unset VS140COMNTOOLS env var.
+    runs-on: windows-2022
+    env:
+      ARTIFACTS_DIR: ${{ github.workspace }}\artifacts
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: Win32-OpenSSH-x64
+        path: ${{ github.workspace }}\artifacts\Win32-OpenSSH-x64
+
+    - name: Download unit test artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: UnitTests-x64
+        path: ${{ github.workspace }}\artifacts\UnitTests-x64
+
+    - name: Capture downloaded artifact directory
+      run: |
+        $artifactDir = "$env:ARTIFACTS_DIR"
+        Write-Verbose -Verbose -Message "Artifacts directory: $artifactDir"
+        Get-ChildItem -Path $artifactDir -Recurse
+
+    - name: Install Win32-OpenSSH
+      run: |
+        Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
+        Install-OpenSSH -SourceDir "$env:ARTIFACTS_DIR/Win32-OpenSSH-x64/x64/Release" -OpenSSHDir "$env:SystemDrive/OpenSSH" -Verbose
+
+    - name: Install Unit Tests
+      run: |
+        Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
+        Install-UnitTests -SourceDir "$env:ARTIFACTS_DIR/UnitTests-x64/x64/Release" -OpenSSHDir "$env:SystemDrive/OpenSSH" -Verbose
+
+    - name: Capture source repo directory for test
+      run: |
+        $sourceDir = "$env:GITHUB_WORKSPACE"
+        Write-Verbose -Verbose -Message "Source repo directory: $sourceDir"
+        Get-ChildItem -Path $sourceDir
+
+    - name: Capture installed OpenSSH directory
+      run: |
+        $installedOpenSSHDir = "$env:SystemDrive/OpenSSH"
+        Write-Verbose -Verbose -Message "Installed OpenSSH directory: $installedOpenSSHDir"
+        Get-ChildItem -Path $installedOpenSSHDir -Recurse
+
+    - name: Run core tests
+      run: |
+        # Run OpenSSH tests
+        Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
+        Invoke-OpenSSHTests -OpenSSHBinPath "$env:SystemDrive/OpenSSH"
+
+    - name: Check test results
+      if: always()
+      run: |
+        # Equivalent of AzDO PublishTestResults@2 with failTaskOnFailedTests: fail if
+        # any NUnit result file reports failures or errors
+        $testResultsPath = "$env:SystemDrive/OpenSSHTests/*.xml"
+        $resultFiles = Get-ChildItem -Path $testResultsPath -ErrorAction SilentlyContinue
+        if (-not $resultFiles) {
+          Write-Warning "No test result files found at: $testResultsPath"
+          return
+        }
+        $failedCount = 0
+        foreach ($resultFile in $resultFiles) {
+          [xml]$testResults = Get-Content -Path $resultFile.FullName
+          $testResultsNode = $testResults.'test-results'
+          if ($null -ne $testResultsNode) {
+            $failures = [int]$testResultsNode.failures + [int]$testResultsNode.errors
+            Write-Verbose -Verbose -Message "$($resultFile.Name): total=$($testResultsNode.total) failures=$($testResultsNode.failures) errors=$($testResultsNode.errors)"
+            $failedCount += $failures
+          }
+        }
+        if ($failedCount -gt 0) {
+          Write-Error "There were $failedCount failed tests"
+          exit 1
+        }
+
+    - name: Stage test results
+      if: always()
+      run: |
+        Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
+        #
+        # Copy test results to results directory
+        $ResultsDirectory = "$env:GITHUB_WORKSPACE/Win32OpenSSHTestResults"
+        Copy-OpenSSHTestResults -ResultsPath $ResultsDirectory
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Win32-OpenSSH-TestResults-Core
+        path: ${{ github.workspace }}\Win32OpenSSHTestResults
+        if-no-files-found: ignore
+
+    - name: Clean up OpenSSH test environment
+      if: always()
+      run: |
+        Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
+        Clear-TestEnvironmentSetup
+
+  test-bash:
+    name: Win32-OpenSSH Bash Tests On Windows
+    needs: build
+    # Pinned to windows-2022: OpenSSHBuildHelper.psm1 detects the VS version from
+    # the MSBuild path ("2022"/"2019"/"2017"); windows-latest now ships VS2026
+    # under "...\Microsoft Visual Studio\18\..." which falls through to the
+    # VS2015 branch and fails on the unset VS140COMNTOOLS env var.
+    runs-on: windows-2022
+    env:
+      ARTIFACTS_DIR: ${{ github.workspace }}\artifacts
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: Win32-OpenSSH-x64
+        path: ${{ github.workspace }}\artifacts\Win32-OpenSSH-x64
+
+    - name: Download bash test config file artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: ConfigFile-x64
+        path: ${{ github.workspace }}\artifacts\ConfigFile-x64
+
+    - name: Capture downloaded artifact directory
+      run: |
+        $artifactDir = "$env:ARTIFACTS_DIR"
+        Write-Verbose -Verbose -Message "Artifacts directory: $artifactDir"
+        Get-ChildItem -Path $artifactDir -Recurse
+
+    - name: Install Win32-OpenSSH
+      run: |
+        Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
+        Install-OpenSSH -SourceDir "$env:ARTIFACTS_DIR/Win32-OpenSSH-x64/x64/Release" -OpenSSHDir "$env:SystemDrive/OpenSSH" -Verbose
+
+    - name: Copy config file artifact for bash tests
+      run: |
+        $configFileSrc = "$env:ARTIFACTS_DIR/ConfigFile-x64/config.h"
+        $configFileDest = "$env:GITHUB_WORKSPACE"
+        Write-Verbose -Verbose -Message "Copying config file from: ${configFileSrc} to: ${configFileDest}"
+        Copy-Item -Path $configFileSrc -Dest $configFileDest -Force
+
+    - name: Capture source repo directory for test
+      run: |
+        $sourceDir = "$env:GITHUB_WORKSPACE"
+        Write-Verbose -Verbose -Message "Source repo directory: $sourceDir"
+        Get-ChildItem -Path $sourceDir
+
+    - name: Capture installed OpenSSH directory
+      run: |
+        $installedOpenSSHDir = "$env:SystemDrive/OpenSSH"
+        Write-Verbose -Verbose -Message "Installed OpenSSH directory: $installedOpenSSHDir"
+        Get-ChildItem -Path $installedOpenSSHDir -Recurse
+
+    - name: Run bash tests
+      run: |
+        # Run OpenSSH bash tests
+        Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
+        Invoke-OpenSSHBashTestsOnly -OpenSSHBinPath "$env:SystemDrive/OpenSSH"
+
+    - name: Stage test results
+      if: always()
+      run: |
+        Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
+        #
+        # Copy test results to results directory
+        $ResultsDirectory = "$env:GITHUB_WORKSPACE/Win32OpenSSHTestResults"
+        Copy-OpenSSHTestResults -ResultsPath $ResultsDirectory
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Win32-OpenSSH-TestResults-Bash
+        path: ${{ github.workspace }}\Win32OpenSSHTestResults
+        if-no-files-found: ignore
+
+    - name: Clean up OpenSSH test environment
+      if: always()
+      run: |
+        Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
+        Clear-TestEnvironmentSetup
