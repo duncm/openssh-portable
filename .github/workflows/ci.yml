@@ -23,6 +23,7 @@ concurrency:
 
 permissions:
   contents: read
+  statuses: write
 
 env:
   VCPKG_CACHE_DIR: ${{ github.workspace }}\binary-cache
@@ -32,8 +33,66 @@ defaults:
     shell: pwsh
 
 jobs:
+  # Resolves the ref being built to a single commit SHA so that every job checks
+  # out the same commit (the ref could advance mid-run) and, for manual runs,
+  # commit statuses are reported to that SHA. On push/pull_request the native
+  # check runs already land on the right commit, so statuses are only reported
+  # for workflow_dispatch runs.
+  resolve:
+    name: Resolve target commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      sha_short: ${{ steps.resolve.outputs.sha_short }}
+    steps:
+    - name: Resolve target ref to a commit SHA
+      id: resolve
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TARGET_REF: ${{ github.event.inputs.target_ref }}
+      run: |
+        if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+          $sha = gh api "repos/${{ github.repository }}/commits/$env:TARGET_REF" --jq '.sha'
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to resolve target ref '$env:TARGET_REF'"
+          }
+        } else {
+          $sha = '${{ github.sha }}'
+        }
+        Write-Verbose -Verbose "Target commit: $sha"
+        "sha=$sha" >> $env:GITHUB_OUTPUT
+        "sha_short=$($sha.Substring(0, 7))" >> $env:GITHUB_OUTPUT
+
+    # Overall run-level status; the report job posts the final state once all
+    # jobs have settled
+    - name: Report pending workflow status
+      if: github.event_name == 'workflow_dispatch'
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TARGET_SHA: ${{ steps.resolve.outputs.sha }}
+      run: |
+        gh api "repos/${{ github.repository }}/statuses/$env:TARGET_SHA" `
+          -f state=pending `
+          -f context="${{ github.workflow }}" `
+          -f description='Workflow run started' `
+          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+  # noop job so the resolved target commit is reported in the workflow run summary.
+  target-commit:
+    name: "Resolved target commit ${{ github.event.inputs.target_ref }} (${{ needs.resolve.outputs.sha_short }})"
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+    - name: noop
+      run: "true"
+
   install-dependencies:
     name: Install vcpkg Dependencies (${{ matrix.arch }})
+    needs: resolve
+    env:
+      TARGET_SHA: ${{ needs.resolve.outputs.sha }}
+      STATUS_CONTEXT: ${{ github.workflow }} / Install vcpkg Dependencies (${{ matrix.arch }})
     # Pinned to windows-2022: OpenSSHBuildHelper.psm1 detects the VS version from
     # the MSBuild path ("2022"/"2019"/"2017"); windows-latest now ships VS2026
     # under "...\Microsoft Visual Studio\18\..." which falls through to the
@@ -48,9 +107,21 @@ jobs:
         - arch: x86
           triplet: x86-custom
     steps:
+    - name: Report pending status
+      if: github.event_name == 'workflow_dispatch'
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh api "repos/${{ github.repository }}/statuses/$env:TARGET_SHA" `
+          -f state=pending `
+          -f context="$env:STATUS_CONTEXT" `
+          -f description='Job started' `
+          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ job.check_run_id }}"
+
     - uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.inputs.target_ref || github.ref }}
+        ref: ${{ needs.resolve.outputs.sha }}
 
     - name: Verify version info
       run: |
@@ -114,9 +185,28 @@ jobs:
         path: ${{ env.VCPKG_CACHE_DIR }}
         if-no-files-found: error
 
+    - name: Report final status
+      if: always() && github.event_name == 'workflow_dispatch'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $state = switch ('${{ job.status }}') {
+          'success'   { 'success' }
+          'cancelled' { 'error' }
+          default     { 'failure' }
+        }
+        gh api "repos/${{ github.repository }}/statuses/$env:TARGET_SHA" `
+          -f state=$state `
+          -f context="$env:STATUS_CONTEXT" `
+          -f description="Job finished with status: ${{ job.status }}" `
+          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ job.check_run_id }}"
+
   build:
     name: Build Package (${{ matrix.arch }})
-    needs: install-dependencies
+    needs: [resolve, install-dependencies]
+    env:
+      TARGET_SHA: ${{ needs.resolve.outputs.sha }}
+      STATUS_CONTEXT: ${{ github.workflow }} / Build Package (${{ matrix.arch }})
     # Pinned to windows-2022: OpenSSHBuildHelper.psm1 detects the VS version from
     # the MSBuild path ("2022"/"2019"/"2017"); windows-latest now ships VS2026
     # under "...\Microsoft Visual Studio\18\..." which falls through to the
@@ -133,9 +223,21 @@ jobs:
           buildOutputDir: Win32
           includeConfig: false
     steps:
+    - name: Report pending status
+      if: github.event_name == 'workflow_dispatch'
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh api "repos/${{ github.repository }}/statuses/$env:TARGET_SHA" `
+          -f state=pending `
+          -f context="$env:STATUS_CONTEXT" `
+          -f description='Job started' `
+          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ job.check_run_id }}"
+
     - uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.inputs.target_ref || github.ref }}
+        ref: ${{ needs.resolve.outputs.sha }}
 
     - name: Install and bootstrap vcpkg
       run: |
@@ -238,9 +340,25 @@ jobs:
           Write-Host "::warning::$uniqueLine"
         }
 
+    - name: Report final status
+      if: always() && github.event_name == 'workflow_dispatch'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $state = switch ('${{ job.status }}') {
+          'success'   { 'success' }
+          'cancelled' { 'error' }
+          default     { 'failure' }
+        }
+        gh api "repos/${{ github.repository }}/statuses/$env:TARGET_SHA" `
+          -f state=$state `
+          -f context="$env:STATUS_CONTEXT" `
+          -f description="Job finished with status: ${{ job.status }}" `
+          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ job.check_run_id }}"
+
   test-core:
     name: Win32-OpenSSH Core Tests On Windows
-    needs: build
+    needs: [resolve, build]
     # Pinned to windows-2022: OpenSSHBuildHelper.psm1 detects the VS version from
     # the MSBuild path ("2022"/"2019"/"2017"); windows-latest now ships VS2026
     # under "...\Microsoft Visual Studio\18\..." which falls through to the
@@ -248,10 +366,24 @@ jobs:
     runs-on: windows-2022
     env:
       ARTIFACTS_DIR: ${{ github.workspace }}\artifacts
+      TARGET_SHA: ${{ needs.resolve.outputs.sha }}
+      STATUS_CONTEXT: ${{ github.workflow }} / Win32-OpenSSH Core Tests On Windows
     steps:
+    - name: Report pending status
+      if: github.event_name == 'workflow_dispatch'
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh api "repos/${{ github.repository }}/statuses/$env:TARGET_SHA" `
+          -f state=pending `
+          -f context="$env:STATUS_CONTEXT" `
+          -f description='Job started' `
+          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ job.check_run_id }}"
+
     - uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.inputs.target_ref || github.ref }}
+        ref: ${{ needs.resolve.outputs.sha }}
 
     - name: Download build artifacts
       uses: actions/download-artifact@v4
@@ -348,9 +480,25 @@ jobs:
         Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
         Clear-TestEnvironmentSetup
 
+    - name: Report final status
+      if: always() && github.event_name == 'workflow_dispatch'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $state = switch ('${{ job.status }}') {
+          'success'   { 'success' }
+          'cancelled' { 'error' }
+          default     { 'failure' }
+        }
+        gh api "repos/${{ github.repository }}/statuses/$env:TARGET_SHA" `
+          -f state=$state `
+          -f context="$env:STATUS_CONTEXT" `
+          -f description="Job finished with status: ${{ job.status }}" `
+          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ job.check_run_id }}"
+
   test-bash:
     name: Win32-OpenSSH Bash Tests On Windows
-    needs: build
+    needs: [resolve, build]
     # Pinned to windows-2022: OpenSSHBuildHelper.psm1 detects the VS version from
     # the MSBuild path ("2022"/"2019"/"2017"); windows-latest now ships VS2026
     # under "...\Microsoft Visual Studio\18\..." which falls through to the
@@ -358,10 +506,24 @@ jobs:
     runs-on: windows-2022
     env:
       ARTIFACTS_DIR: ${{ github.workspace }}\artifacts
+      TARGET_SHA: ${{ needs.resolve.outputs.sha }}
+      STATUS_CONTEXT: ${{ github.workflow }} / Win32-OpenSSH Bash Tests On Windows
     steps:
+    - name: Report pending status
+      if: github.event_name == 'workflow_dispatch'
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh api "repos/${{ github.repository }}/statuses/$env:TARGET_SHA" `
+          -f state=pending `
+          -f context="$env:STATUS_CONTEXT" `
+          -f description='Job started' `
+          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ job.check_run_id }}"
+
     - uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.inputs.target_ref || github.ref }}
+        ref: ${{ needs.resolve.outputs.sha }}
 
     - name: Download build artifacts
       uses: actions/download-artifact@v4
@@ -433,3 +595,52 @@ jobs:
       run: |
         Import-Module -Name "$env:GITHUB_WORKSPACE/contrib/win32/openssh/AzDOBuildTools" -Force
         Clear-TestEnvironmentSetup
+
+    - name: Report final status
+      if: always() && github.event_name == 'workflow_dispatch'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $state = switch ('${{ job.status }}') {
+          'success'   { 'success' }
+          'cancelled' { 'error' }
+          default     { 'failure' }
+        }
+        gh api "repos/${{ github.repository }}/statuses/$env:TARGET_SHA" `
+          -f state=$state `
+          -f context="$env:STATUS_CONTEXT" `
+          -f description="Job finished with status: ${{ job.status }}" `
+          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ job.check_run_id }}"
+
+  # Fan-in job: finalizes the run-level status posted by the resolve job. Also
+  # covers jobs that never ran (skipped counts as failure), which otherwise
+  # report nothing.
+  report:
+    name: Report workflow status
+    needs: [resolve, install-dependencies, build, test-core, test-bash]
+    if: always() && github.event_name == 'workflow_dispatch' && needs.resolve.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      TARGET_SHA: ${{ needs.resolve.outputs.sha }}
+    steps:
+    - name: Report final workflow status
+      env:
+        GH_TOKEN: ${{ github.token }}
+        NEEDS_JSON: ${{ toJSON(needs) }}
+      run: |
+        $needs = $env:NEEDS_JSON | ConvertFrom-Json
+        $results = $needs.PSObject.Properties.Value.result
+        if ($results -contains 'cancelled') {
+          $state = 'error'
+        } elseif ($results | Where-Object { $_ -ne 'success' }) {
+          $state = 'failure'
+        } else {
+          $state = 'success'
+        }
+        $description = ($needs.PSObject.Properties | ForEach-Object { "$($_.Name): $($_.Value.result)" }) -join ', '
+        Write-Verbose -Verbose "Overall state: $state ($description)"
+        gh api "repos/${{ github.repository }}/statuses/$env:TARGET_SHA" `
+          -f state=$state `
+          -f context="${{ github.workflow }}" `
+          -f description="$description" `
+          -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
