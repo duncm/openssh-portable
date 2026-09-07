@@ -15,6 +15,10 @@ on:
         description: 'Checkout from'
         required: true
         default: latestw_all
+      set_as_latest_release:
+        description: 'Set as the latest release'
+        type: boolean
+        default: true
 
 # Approximates the AzDO batched trigger: coalesce runs on the same ref
 concurrency:
@@ -612,12 +616,108 @@ jobs:
           -f description="Job finished with status: ${{ job.status }}" `
           -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/job/${{ job.check_run_id }}"
 
+  release:
+    name: Create GitHub release
+    needs: [resolve, test-core, test-bash]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TARGET_SHA: ${{ needs.resolve.outputs.sha }}
+      TARGET_SHA_SHORT: ${{ needs.resolve.outputs.sha_short }}
+      TARGET_REF: ${{ github.event.inputs.target_ref }}
+    steps:
+    - name: Download build artifacts (x64)
+      uses: actions/download-artifact@v4
+      with:
+        name: Win32-OpenSSH-x64
+        path: ${{ github.workspace }}/release-assets/Win32-OpenSSH-x64
+
+    - name: Download build artifacts (x86)
+      uses: actions/download-artifact@v4
+      with:
+        name: Win32-OpenSSH-x86
+        path: ${{ github.workspace }}/release-assets/Win32-OpenSSH-x86
+
+    - name: Package release assets
+      run: |
+        $ErrorActionPreference = 'Stop'
+        foreach ($arch in 'x64', 'x86') {
+          $sourceDir = "$env:GITHUB_WORKSPACE/release-assets/Win32-OpenSSH-$arch"
+          $zipPath = "$env:GITHUB_WORKSPACE/release-assets/Win32-OpenSSH-$arch.zip"
+          Compress-Archive -Path "$sourceDir/*" -DestinationPath $zipPath
+          Write-Verbose -Verbose "Created $zipPath"
+        }
+
+    - name: Create release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        # Tag is <commit date as YYYYmmddHHMMSS>-<target_ref>-<sha_short> and
+        # title is "<target_ref> (<sha_short>)"; the target ref is dropped from
+        # both when it is itself a (possibly abbreviated) sha of the resolved
+        # commit
+        $commitDate = gh api "repos/${{ github.repository }}/commits/$env:TARGET_SHA" --jq '.commit.committer.date | gsub("[^0-9]"; "")'
+        if ($LASTEXITCODE -ne 0) {
+          throw "Failed to get committer date for commit $env:TARGET_SHA"
+        }
+        $refIsSha = $env:TARGET_SHA.StartsWith($env:TARGET_REF, [System.StringComparison]::OrdinalIgnoreCase)
+        if ($refIsSha) {
+          $tag = "$commitDate-$env:TARGET_SHA_SHORT"
+          $title = $env:TARGET_SHA_SHORT
+        } else {
+          $tag = "$commitDate-$env:TARGET_REF-$env:TARGET_SHA_SHORT"
+          $title = "$env:TARGET_REF ($env:TARGET_SHA_SHORT)"
+        }
+        #
+        # The tag is a pure function of the target commit, so an existing
+        # release means this build was already published
+        gh release view $tag --repo ${{ github.repository }} *> $null
+        if ($LASTEXITCODE -eq 0) {
+          Write-Host "A release for tag $tag already exists; skipping release creation"
+          return
+        }
+        #
+        # If the target ref is a branch, list pull requests from it to the
+        # upstream (parent) repo in the release notes. Best effort: lookup
+        # failures are ignored.
+        $runUrl = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        $prSection = ''
+        if (-not $refIsSha) {
+          $parentRepo = gh api "repos/${{ github.repository }}" --jq '.parent.full_name // empty'
+          if ($LASTEXITCODE -eq 0 -and $parentRepo) {
+            $prsJson = gh api "repos/$parentRepo/pulls?state=all&head=${{ github.repository_owner }}:$env:TARGET_REF"
+            if ($LASTEXITCODE -eq 0) {
+              $prLines = $prsJson | ConvertFrom-Json | ForEach-Object {
+                "[![build](https://img.shields.io/github/checks-status/${{ github.repository }}/$($tag)?logo=github&label=actions)]($runUrl) [![$parentRepo#$($_.number)](https://img.shields.io/github/pulls/detail/state/$parentRepo/$($_.number)?logo=github&label=$([System.Uri]::EscapeDataString("$parentRepo#$($_.number)")))]($($_.html_url))"
+              }
+              if ($prLines) {
+                $prSection = "`n`n" + ($prLines -join "`n`n")
+              }
+            }
+          }
+        }
+        $notes = "Win32-OpenSSH built from ``$env:TARGET_REF`` at commit $env:TARGET_SHA.`n`nCreated by GitHub Actions run: $runUrl$prSection"
+        gh release create $tag `
+          --repo ${{ github.repository }} `
+          --target $env:TARGET_SHA `
+          --latest=${{ inputs.set_as_latest_release }} `
+          --title $title `
+          --notes $notes `
+          "$env:GITHUB_WORKSPACE/release-assets/Win32-OpenSSH-x64.zip" `
+          "$env:GITHUB_WORKSPACE/release-assets/Win32-OpenSSH-x86.zip"
+        if ($LASTEXITCODE -ne 0) {
+          throw "gh release create failed with exit code $LASTEXITCODE"
+        }
+
   # Fan-in job: finalizes the run-level status posted by the resolve job. Also
   # covers jobs that never ran (skipped counts as failure), which otherwise
   # report nothing.
   report:
     name: Report workflow status
-    needs: [resolve, install-dependencies, build, test-core, test-bash]
+    needs: [resolve, install-dependencies, build, test-core, test-bash, release]
     if: always() && github.event_name == 'workflow_dispatch' && needs.resolve.result == 'success'
     runs-on: ubuntu-latest
     env:
